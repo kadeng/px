@@ -289,7 +289,7 @@ class Proxy(httpserver.SimpleHTTPRequestHandler):
 
         return False
 
-    def do_socket(self, xheaders=[], destination=None):
+    def do_socket(self, xheaders=[], destination=None, quick_timeout=False):
         dprint("Entering")
 
         # Connect to proxy or destination
@@ -436,17 +436,20 @@ class Proxy(httpserver.SimpleHTTPRequestHandler):
                     body += d
                 headers.append(("Content-Length", str(len(body))))
             else:
-                dprint("Not sure how much")
-                while not State.exit:
-                    time.sleep(0.1)
-                    d = self.client_fp.read(1024)
-                    if len(d) < 1024:
-                        break
-                    body += d
+                if quick_timeout:
+                    print("Not waiting for data")
+                else:
+                    dprint("Not sure how much")
+                    while not State.exit:
+                        time.sleep(0.1)
+                        d = self.client_fp.read(1024)
+                        if len(d) < 1024:
+                            break
+                        body += d
 
         return resp, headers, body
 
-    def do_transaction(self):
+    def do_transaction(self, quick_timeout=False):
         dprint("Entering")
 
         ipport = self.get_destination()
@@ -467,7 +470,7 @@ class Proxy(httpserver.SimpleHTTPRequestHandler):
                 dprint("Auth required")
                 ntlm_challenge = ""
                 for header in headers:
-                    if header[0] == "Proxy-Authenticate" and "Negotiate" in header[1]:
+                    if header[0] == "Proxy-Authenticate" and ("Negotiate" in header[1] or "NEGOTIATE" in header[1]):
                         ntlm_challenge = header[1].split()[1]
                         break
 
@@ -479,7 +482,7 @@ class Proxy(httpserver.SimpleHTTPRequestHandler):
                         return 503, None, None
                     resp, headers, body = self.do_socket({
                         "Proxy-Authorization": "Negotiate %s" % ntlm_resp
-                    })
+                    }, quick_timeout=quick_timeout)
 
                     return resp, headers, body
                 else:
@@ -545,7 +548,7 @@ class Proxy(httpserver.SimpleHTTPRequestHandler):
         dprint("Entering")
 
         cl = 0
-        resp, headers, body = self.do_transaction()
+        resp, headers, body = self.do_transaction(quick_timeout=True)
         if resp >= 400:
             dprint("Error %d" % resp)
             self.send_error(resp)
