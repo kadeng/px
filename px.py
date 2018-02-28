@@ -21,25 +21,30 @@ import traceback
 try:
     import concurrent.futures
 except ImportError:
-    print("Requires modules futures")
+    print("Requires module futures")
     sys.exit()
 
 try:
     import netaddr
 except ImportError:
-    print("Requires modules netaddr")
+    print("Requires module netaddr")
     sys.exit()
+
+try:
+    import pypac
+except ImportError:
+    print("Missing module pypac, running without WPAD or PAC proxy support")
 
 try:
     import psutil
 except ImportError:
-    print("Requires modules psutil")
+    print("Requires module psutil")
     sys.exit()
 
 try:
     import winkerberos
 except ImportError:
-    print("Requires Python module winkerberos")
+    print("Requires module winkerberos")
     sys.exit()
 
 # Python 2.x vs 3.x support
@@ -48,12 +53,14 @@ try:
     import http.server as httpserver
     import socketserver
     import urllib.parse as urlparse
+    import urllib.request as urlrequest
     import winreg
 except ImportError:
     import ConfigParser as configparser
     import SimpleHTTPServer as httpserver
     import SocketServer as socketserver
     import urlparse
+    import urllib as urlrequest
     import _winreg as winreg
 
     os.getppid = psutil.Process().ppid
@@ -140,8 +147,13 @@ Configuration:
   --idle=  settings:idle=
   Idle timeout in seconds for HTTP connect sessions. Valid integer, default: 30
 
-  --socktimeout= settings:socktimeout=
+  --socktimeout=  settings:socktimeout=
   Timeout in seconds for connections before giving up. Valid float, default: 5
+
+  --proxyreload=  settings:proxyreload=
+  Time interval in seconds before refreshing proxy info. Valid int, default: 60
+    Proxy info reloaded from a PAC file found via WPAD or AutoConfig URL, or
+    manual proxy info defined in Internet Options
 
   --foreground  settings:foreground=
   Run in foreground when frozen or with pythonw.exe. 0 or 1, default: 0
@@ -153,6 +165,12 @@ Configuration:
     Logs are written to working directory and over-written on startup
     A log is automatically created if Px crashes for some reason""" % __version__
 
+# Proxy modes - source of proxy info
+MODE_NONE = 0
+MODE_CONFIG = 1
+MODE_PAC = 2
+MODE_MANUAL = 3
+
 class State(object):
     allow = netaddr.IPGlob("*.*.*.*")
     config = None
@@ -160,6 +178,9 @@ class State(object):
     hostonly = False
     logger = None
     noproxy = netaddr.IPSet([])
+    pac = None
+    proxy_mode = MODE_NONE
+    proxy_refresh = None
     proxy_server = []
     stdout = None
     useragent = ""
@@ -184,16 +205,19 @@ class Log(object):
             self.file.write(data)
         except:
             pass
-        self.file.flush()
         if self.stdout is not None:
             self.stdout.write(data)
+        self.flush()
     def flush(self):
         self.file.flush()
+        if self.stdout is not None:
+            self.stdout.flush()
 
 def dprint(*objs):
     if State.logger != None:
         print(multiprocessing.current_process().name + ": " + threading.current_thread().name + ": " + str(int(time.time())) + ": " + sys._getframe(1).f_code.co_name + ": ", end="")
         print(*objs)
+        sys.stdout.flush()
 
 def dfile():
     return "debug-%s.log" % multiprocessing.current_process().name
@@ -605,29 +629,45 @@ class Proxy(httpserver.SimpleHTTPRequestHandler):
         dprint("Done")
 
     def get_destination(self):
+        netloc = self.path
+        path = "/"
+        if self.command != "CONNECT":
+            parse = urlparse.urlparse(self.path, allow_fragments=False)
+            if parse.netloc:
+                netloc = parse.netloc
+            if ":" not in netloc:
+                port = parse.port
+                if not port:
+                    if parse.scheme == "http":
+                        port = 80
+                    elif parse.scheme == "https":
+                        port = 443
+                netloc = netloc + ":" + str(port)
+
+            path = parse.path or "/"
+            if parse.params:
+                path = path + ";" + parse.params
+            if parse.query:
+                path = path + "?" + parse.query
+        dprint(netloc)
+
+        if State.proxy_mode != MODE_CONFIG:
+            load_proxy()
+
+        direct = -1
+        if State.proxy_mode == MODE_PAC:
+            pac_proxy, direct = find_proxy_for_url(netloc)
+            if direct == 0:
+                ipport = netloc.split(":")
+                ipport[1] = int(ipport[1])
+                dprint("Direct connection from PAC")
+                return tuple(ipport)
+
+            if pac_proxy:
+                dprint("Proxy from PAC = " + str(pac_proxy))
+                State.proxy_server = pac_proxy
+
         if State.noproxy.size:
-            netloc = self.path
-            path = "/"
-            if self.command != "CONNECT":
-                parse = urlparse.urlparse(self.path, allow_fragments=False)
-                if parse.netloc:
-                    netloc = parse.netloc
-                if ":" not in netloc:
-                    port = parse.port
-                    if not port:
-                        if parse.scheme == "http":
-                            port = 80
-                        elif parse.scheme == "https":
-                            port = 443
-                    netloc = netloc + ":" + str(port)
-
-                path = parse.path or "/"
-                if parse.params:
-                    path = path + ";" + parse.params
-                if parse.query:
-                    path = path + "?" + parse.query
-
-            dprint(netloc)
             addr = []
             spl = netloc.split(":", 1)
             try:
@@ -697,7 +737,7 @@ def serve_forever(httpd):
     httpd.shutdown()
 
 def start_worker(pipeout):
-    parsecli()
+    parse_config()
     httpd = ThreadedTCPServer(
         (State.config.get("proxy", "listen").strip(), State.config.getint("proxy", "port")),
         Proxy, bind_and_activate=False
@@ -707,7 +747,7 @@ def start_worker(pipeout):
 
     serve_forever(httpd)
 
-def runpool():
+def run_pool():
     try:
         httpd = ThreadedTCPServer(
             (State.config.get("proxy", "listen").strip(), State.config.getint("proxy", "port")), Proxy
@@ -734,7 +774,64 @@ def runpool():
 ###
 # Parse settings and command line
 
-def parseproxy(proxystrs):
+def load_proxy():
+    # Return if proxies specified in Px config
+    # Check if need to refresh
+    if (State.proxy_mode == MODE_CONFIG or
+        (State.proxy_refresh is not None and
+         time.time() - State.proxy_refresh < State.config.getint("settings", "proxyreload"))):
+        dprint("Skip proxy refresh")
+        return
+
+    # Reset proxy server list
+    State.proxy_mode = MODE_NONE
+    State.proxy_server = []
+
+    # First use pypac for WPAD or PAC config
+    if "pypac" in sys.modules:
+        State.pac = pypac.get_pac()
+        # Fallback for file:/// URLs
+        if State.pac is None:
+            acu = pypac.windows.autoconfig_url_from_registry()
+            if acu:
+                acu = acu.replace("file:///", "")
+                if ":" not in acu:
+                    acu = "c:\\" + acu
+                if os.path.isfile(acu):
+                    dprint("Loading " + acu)
+                    with open(acu, "r") as f:
+                        State.pac = pypac.parser.PACFile(f.read())
+
+    # Fall back to any manual proxies defined in Internet Options
+    if State.pac is None:
+        parse_proxy(",".join([urlparse.urlparse(i).netloc
+            for i in set(urlrequest.getproxies().values())]))
+
+        if State.proxy_server:
+            State.proxy_mode = MODE_MANUAL
+    else:
+        State.proxy_mode = MODE_PAC
+
+    dprint("Proxy mode = " + str(State.proxy_mode))
+    State.proxy_refresh = time.time()
+
+def find_proxy_for_url(netloc):
+    pac_proxy = []
+    direct = -1
+    count = 0
+    if State.pac is not None:
+        for i in pypac.parser.parse_pac_value(
+                State.pac.find_proxy_for_url(netloc, netloc)):
+            if i != "DIRECT":
+                pac_proxy.append(tuple(urlparse.urlparse(i).netloc.split(":")))
+            else:
+                direct = count
+            count += 1
+        dprint("pypac = " + str(pac_proxy), str(direct))
+
+    return pac_proxy, direct
+
+def parse_proxy(proxystrs):
     if not proxystrs:
         return
 
@@ -752,10 +849,11 @@ def parseproxy(proxystrs):
             print("Bad proxy server definition: " + proxystr)
             sys.exit()
 
-        State.proxy_server.append(tuple(pserver))
+        if tuple(pserver) not in State.proxy_server:
+            State.proxy_server.append(tuple(pserver))
     dprint(State.proxy_server)
 
-def parseipranges(iprangesconfig):
+def parse_ip_ranges(iprangesconfig):
     ipranges = netaddr.IPSet([])
 
     iprangessplit = [i.strip() for i in iprangesconfig.split(",")]
@@ -777,13 +875,13 @@ def parseipranges(iprangesconfig):
             sys.exit()
     return ipranges
 
-def parseallow(allow):
-    State.allow = parseipranges(allow)
+def parse_allow(allow):
+    State.allow = parse_ip_ranges(allow)
 
-def parsenoproxy(noproxy):
-    State.noproxy = parseipranges(noproxy)
+def parse_noproxy(noproxy):
+    State.noproxy = parse_ip_ranges(noproxy)
 
-def setuseragent(useragent):
+def set_useragent(useragent):
     State.useragent = useragent
 
 def cfg_int_init(section, name, default, override=False):
@@ -838,12 +936,12 @@ def save():
 
     sys.exit()
 
-def parsecli():
+def parse_config():
     if "--debug" in sys.argv:
         State.logger = Log(dfile(), "w")
 
     if getattr(sys, "frozen", False) != False or "pythonw.exe" in sys.executable:
-        attachConsole()
+        attach_console()
 
     if "-h" in sys.argv or "--help" in sys.argv:
         print(HELP)
@@ -867,21 +965,14 @@ def parsecli():
     if "proxy" not in State.config.sections():
         State.config.add_section("proxy")
 
-    cfg_str_init("proxy", "server", "", parseproxy)
-
+    cfg_str_init("proxy", "server", "", parse_proxy)
     cfg_int_init("proxy", "port", "3128")
-
     cfg_str_init("proxy", "listen", "127.0.0.1")
-
-    cfg_str_init("proxy", "allow", "*.*.*.*", parseallow)
-
+    cfg_str_init("proxy", "allow", "*.*.*.*", parse_allow)
     cfg_int_init("proxy", "gateway", "0")
-
     cfg_int_init("proxy", "hostonly", "0")
-
-    cfg_str_init("proxy", "noproxy", "", parsenoproxy)
-
-    cfg_str_init("proxy", "useragent", "", setuseragent)
+    cfg_str_init("proxy", "noproxy", "", parse_noproxy)
+    cfg_str_init("proxy", "useragent", "", set_useragent)
 
     # [settings] section
     if "settings" not in State.config.sections():
@@ -891,6 +982,7 @@ def parsecli():
     cfg_int_init("settings", "threads", "5")
     cfg_int_init("settings", "idle", "30")
     cfg_float_init("settings", "socktimeout", "5.0")
+    cfg_int_init("settings", "proxyreload", "60")
     cfg_int_init("settings", "foreground", "0")
 
     cfg_int_init("settings", "log", "0" if State.logger is None else "1")
@@ -902,19 +994,19 @@ def parsecli():
         if "=" in sys.argv[i]:
             val = sys.argv[i].split("=")[1]
             if "--proxy=" in sys.argv[i] or "--server=" in sys.argv[i]:
-                cfg_str_init("proxy", "server", val, parseproxy, True)
+                cfg_str_init("proxy", "server", val, parse_proxy, True)
             elif "--listen=" in sys.argv[i]:
                 cfg_str_init("proxy", "listen", val, None, True)
             elif "--port=" in sys.argv[i]:
                 cfg_int_init("proxy", "port", val, True)
             elif "--allow=" in sys.argv[i]:
-                cfg_str_init("proxy", "allow", val, parseallow, True)
+                cfg_str_init("proxy", "allow", val, parse_allow, True)
             elif "--noproxy=" in sys.argv[i]:
-                cfg_str_init("proxy", "noproxy", val, parsenoproxy, True)
+                cfg_str_init("proxy", "noproxy", val, parse_noproxy, True)
             elif "--useragent=" in sys.argv[i]:
-                cfg_str_init("proxy", "useragent", val, setuseragent, True)
+                cfg_str_init("proxy", "useragent", val, set_useragent, True)
             else:
-                for j in ["workers", "threads", "idle"]:
+                for j in ["workers", "threads", "idle", "proxyreload"]:
                     if "--" + j + "=" in sys.argv[i]:
                         cfg_int_init("settings", j, val, True)
 
@@ -952,7 +1044,7 @@ def parsecli():
                  State.config.get("proxy", "allow") in ["*.*.*.*", "0.0.0.0/0"])):
             # Purge allow rules
             dprint("Turning allow off")
-            cfg_str_init("proxy", "allow", "", parseallow, True)
+            cfg_str_init("proxy", "allow", "", parse_allow, True)
 
     if "--install" in sys.argv:
         install()
@@ -963,7 +1055,12 @@ def parsecli():
     elif "--save" in sys.argv:
         save()
 
-    if not State.proxy_server and not State.config.get("proxy", "noproxy"):
+    if State.proxy_server:
+        State.proxy_mode = MODE_CONFIG
+    else:
+        load_proxy()
+
+    if State.proxy_mode == MODE_NONE and not State.config.get("proxy", "noproxy"):
         print("No proxy server or noproxy list defined")
         sys.exit()
 
@@ -979,7 +1076,7 @@ def parsecli():
 
     if getattr(sys, "frozen", False) != False or "pythonw.exe" in sys.executable:
         if State.config.getint("settings", "foreground") == 0:
-            detachConsole()
+            detach_console()
 
     socket.setdefaulttimeout(State.config.getfloat("settings", "socktimeout"))
 
@@ -1091,7 +1188,7 @@ def uninstall():
 ###
 # Attach/detach console
 
-def attachConsole():
+def attach_console():
     if ctypes.windll.kernel32.GetConsoleWindow() != 0:
         dprint("Already attached to a console")
         return
@@ -1129,7 +1226,7 @@ def attachConsole():
 
     reopen_stdout()
 
-def detachConsole():
+def detach_console():
     if ctypes.windll.kernel32.GetConsoleWindow() == 0:
         return
 
@@ -1147,6 +1244,6 @@ if __name__ == "__main__":
     multiprocessing.freeze_support()
     sys.excepthook = handle_exceptions
 
-    parsecli()
+    parse_config()
 
-    runpool()
+    run_pool()
